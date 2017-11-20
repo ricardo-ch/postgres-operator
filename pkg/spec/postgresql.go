@@ -92,6 +92,7 @@ type PostgresSpec struct {
 	Patroni         `json:"patroni,omitempty"`
 	Resources       `json:"resources,omitempty"`
 
+	UsersSecretsNamespace string `json:"usersSecretsNamespace"`
 	TeamID              string   `json:"teamId"`
 	AllowedSourceRanges []string `json:"allowedSourceRanges"`
 	DockerImage         string   `json:"dockerImage,omitempty"`

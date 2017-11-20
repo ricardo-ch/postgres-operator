@@ -5,6 +5,7 @@ import (
 	"reflect"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/pkg/api/v1"
 	policybeta1 "k8s.io/client-go/pkg/apis/policy/v1beta1"
 
 	"github.com/zalando-incubator/postgres-operator/pkg/spec"
@@ -312,35 +313,42 @@ func (c *Cluster) syncSecrets() error {
 	secrets := c.generateUserSecrets()
 
 	for secretUsername, secretSpec := range secrets {
-		secret, err := c.KubeClient.Secrets(secretSpec.Namespace).Create(secretSpec)
-		if k8sutil.ResourceAlreadyExists(err) {
-			var userMap map[string]spec.PgUser
-			curSecret, err2 := c.KubeClient.Secrets(secretSpec.Namespace).Get(secretSpec.Name, metav1.GetOptions{})
-			if err2 != nil {
-				return fmt.Errorf("could not get current secret: %v", err2)
-			}
-			c.logger.Debugf("secret %q already exists, fetching it's password", util.NameFromMeta(curSecret.ObjectMeta))
-			if secretUsername == c.systemUsers[constants.SuperuserKeyName].Name {
-				secretUsername = constants.SuperuserKeyName
-				userMap = c.systemUsers
-			} else if secretUsername == c.systemUsers[constants.ReplicationUserKeyName].Name {
-				secretUsername = constants.ReplicationUserKeyName
-				userMap = c.systemUsers
-			} else {
-				userMap = c.pgUsers
-			}
-			pwdUser := userMap[secretUsername]
-			pwdUser.Password = string(curSecret.Data["password"])
-			userMap[secretUsername] = pwdUser
-
-			continue
-		} else {
-			if err != nil {
-				return fmt.Errorf("could not create secret for user %q: %v", secretUsername, err)
-			}
-			c.Secrets[secret.UID] = secret
-			c.logger.Debugf("created new secret %q, uid: %q", util.NameFromMeta(secret.ObjectMeta), secret.UID)
+		c.syncSecret(secretUsername, secretSpec, secretSpec.Namespace)
+		if len(c.Spec.UsersSecretsNamespace) > 0 {
+			c.syncSecret(secretUsername, secretSpec, c.Spec.UsersSecretsNamespace)
 		}
+	}
+
+	return nil
+}
+
+func (c *Cluster) syncSecret(secretUsername string, secretSpec *v1.Secret, secretNamespace string) error {
+	secret, err := c.KubeClient.Secrets(secretNamespace).Create(secretSpec)
+	if k8sutil.ResourceAlreadyExists(err) {
+		var userMap map[string]spec.PgUser
+		curSecret, err2 := c.KubeClient.Secrets(secretNamespace).Get(secretSpec.Name, metav1.GetOptions{})
+		if err2 != nil {
+			return fmt.Errorf("could not get current secret: %v", err2)
+		}
+		c.logger.Debugf("secret %q already exists, fetching it's password", util.NameFromMeta(curSecret.ObjectMeta))
+		if secretUsername == c.systemUsers[constants.SuperuserKeyName].Name {
+			secretUsername = constants.SuperuserKeyName
+			userMap = c.systemUsers
+		} else if secretUsername == c.systemUsers[constants.ReplicationUserKeyName].Name {
+			secretUsername = constants.ReplicationUserKeyName
+			userMap = c.systemUsers
+		} else {
+			userMap = c.pgUsers
+		}
+		pwdUser := userMap[secretUsername]
+		pwdUser.Password = string(curSecret.Data["password"])
+		userMap[secretUsername] = pwdUser
+	} else {
+		if err != nil {
+			return fmt.Errorf("could not create secret for user %q: %v", secretUsername, err)
+		}
+		c.Secrets[secret.UID] = secret
+		c.logger.Debugf("created new secret %q, uid: %q", util.NameFromMeta(secret.ObjectMeta), secret.UID)
 	}
 
 	return nil
