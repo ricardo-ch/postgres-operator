@@ -7,15 +7,18 @@ import (
 
 	"github.com/zalando-incubator/postgres-operator/pkg/spec"
 	"github.com/zalando-incubator/postgres-operator/pkg/util"
+	"reflect"
 )
 
 const (
-	createUserSQL    = `SET LOCAL synchronous_commit = 'local'; CREATE ROLE "%s" %s %s;`
-	alterUserSQL     = `ALTER ROLE "%s" %s`
-	grantToUserSQL   = `GRANT %s TO "%s"`
-	doBlockStmt      = `SET LOCAL synchronous_commit = 'local'; DO $$ BEGIN %s; END;$$;`
-	passwordTemplate = "ENCRYPTED PASSWORD '%s'"
-	inRoleTemplate   = `IN ROLE %s`
+	createUserSQL        = `SET LOCAL synchronous_commit = 'local'; CREATE ROLE "%s" %s %s;`
+	alterUserSQL         = `ALTER ROLE "%s" %s`
+	alterRoleResetAllSQL = `ALTER ROLE "%s" RESET ALL`
+	alterRoleSetSQL      = `ALTER ROLE "%s" SET %s TO %s`
+	grantToUserSQL       = `GRANT %s TO "%s"`
+	doBlockStmt          = `SET LOCAL synchronous_commit = 'local'; DO $$ BEGIN %s; END;$$;`
+	passwordTemplate     = "ENCRYPTED PASSWORD '%s'"
+	inRoleTemplate       = `IN ROLE %s`
 )
 
 // DefaultUserSyncStrategy implements a user sync strategy that merges already existing database users
@@ -26,7 +29,7 @@ type DefaultUserSyncStrategy struct {
 }
 
 // ProduceSyncRequests figures out the types of changes that need to happen with the given users.
-func (s DefaultUserSyncStrategy) ProduceSyncRequests(dbUsers spec.PgUserMap,
+func (strategy DefaultUserSyncStrategy) ProduceSyncRequests(dbUsers spec.PgUserMap,
 	newUsers spec.PgUserMap) (reqs []spec.PgSyncUserRequest) {
 
 	// No existing roles are deleted or stripped of role memebership/flags
@@ -34,6 +37,9 @@ func (s DefaultUserSyncStrategy) ProduceSyncRequests(dbUsers spec.PgUserMap,
 		dbUser, exists := dbUsers[name]
 		if !exists {
 			reqs = append(reqs, spec.PgSyncUserRequest{Kind: spec.PGSyncUserAdd, User: newUser})
+			if len(newUser.Parameters) > 0 {
+				reqs = append(reqs, spec.PgSyncUserRequest{Kind: spec.PGSyncAlterSet, User: newUser})
+			}
 		} else {
 			r := spec.PgSyncUserRequest{}
 			newMD5Password := util.PGUserPassword(newUser)
@@ -54,6 +60,9 @@ func (s DefaultUserSyncStrategy) ProduceSyncRequests(dbUsers spec.PgUserMap,
 				r.User.Name = newUser.Name
 				reqs = append(reqs, r)
 			}
+			if len(newUser.Parameters) > 0 && !reflect.DeepEqual(dbUser.Parameters, newUser.Parameters) {
+				reqs = append(reqs, spec.PgSyncUserRequest{Kind: spec.PGSyncAlterSet, User: newUser})
+			}
 		}
 	}
 
@@ -61,16 +70,20 @@ func (s DefaultUserSyncStrategy) ProduceSyncRequests(dbUsers spec.PgUserMap,
 }
 
 // ExecuteSyncRequests makes actual database changes from the requests passed in its arguments.
-func (s DefaultUserSyncStrategy) ExecuteSyncRequests(reqs []spec.PgSyncUserRequest, db *sql.DB) error {
+func (strategy DefaultUserSyncStrategy) ExecuteSyncRequests(reqs []spec.PgSyncUserRequest, db *sql.DB) error {
 	for _, r := range reqs {
 		switch r.Kind {
 		case spec.PGSyncUserAdd:
-			if err := s.createPgUser(r.User, db); err != nil {
+			if err := strategy.createPgUser(r.User, db); err != nil {
 				return fmt.Errorf("could not create user %q: %v", r.User.Name, err)
 			}
 		case spec.PGsyncUserAlter:
-			if err := s.alterPgUser(r.User, db); err != nil {
+			if err := strategy.alterPgUser(r.User, db); err != nil {
 				return fmt.Errorf("could not alter user %q: %v", r.User.Name, err)
+			}
+		case spec.PGSyncAlterSet:
+			if err := strategy.alterPgUserSet(r.User, db); err != nil {
+				return fmt.Errorf("could not set custom user %q parameters: %v", r.User.Name, err)
 			}
 		default:
 			return fmt.Errorf("unrecognized operation: %v", r.Kind)
@@ -79,8 +92,17 @@ func (s DefaultUserSyncStrategy) ExecuteSyncRequests(reqs []spec.PgSyncUserReque
 	}
 	return nil
 }
+func (strategy DefaultUserSyncStrategy) alterPgUserSet(user spec.PgUser, db *sql.DB) (err error) {
+	queries := produceAlterRoleSetStmts(user)
+	query := fmt.Sprintf(doBlockStmt, strings.Join(queries, ";"))
+	if _, err = db.Exec(query); err != nil {
+		err = fmt.Errorf("dB error: %v, query: %s", err, query)
+		return
+	}
+	return
+}
 
-func (s DefaultUserSyncStrategy) createPgUser(user spec.PgUser, db *sql.DB) (err error) {
+func (strategy DefaultUserSyncStrategy) createPgUser(user spec.PgUser, db *sql.DB) (err error) {
 	var userFlags []string
 	var userPassword string
 
@@ -98,16 +120,16 @@ func (s DefaultUserSyncStrategy) createPgUser(user spec.PgUser, db *sql.DB) (err
 	}
 	query := fmt.Sprintf(createUserSQL, user.Name, strings.Join(userFlags, " "), userPassword)
 
-	_, err = db.Query(query) // TODO: Try several times
+	_, err = db.Exec(query) // TODO: Try several times
 	if err != nil {
-		err = fmt.Errorf("dB error: %v, query: %q", err, query)
+		err = fmt.Errorf("dB error: %v, query: %s", err, query)
 		return
 	}
 
 	return
 }
 
-func (s DefaultUserSyncStrategy) alterPgUser(user spec.PgUser, db *sql.DB) (err error) {
+func (strategy DefaultUserSyncStrategy) alterPgUser(user spec.PgUser, db *sql.DB) (err error) {
 	var resultStmt []string
 
 	if user.Password != "" || len(user.Flags) > 0 {
@@ -124,9 +146,9 @@ func (s DefaultUserSyncStrategy) alterPgUser(user spec.PgUser, db *sql.DB) (err 
 
 	query := fmt.Sprintf(doBlockStmt, strings.Join(resultStmt, ";"))
 
-	_, err = db.Query(query) // TODO: Try several times
+	_, err = db.Exec(query) // TODO: Try several times
 	if err != nil {
-		err = fmt.Errorf("dB error: %v query %q", err, query)
+		err = fmt.Errorf("dB error: %v query %s", err, query)
 		return
 	}
 
@@ -135,7 +157,7 @@ func (s DefaultUserSyncStrategy) alterPgUser(user spec.PgUser, db *sql.DB) (err 
 
 func produceAlterStmt(user spec.PgUser) string {
 	// ALTER ROLE ... LOGIN ENCRYPTED PASSWORD ..
-	result := make([]string, 1)
+	result := make([]string, 0)
 	password := user.Password
 	flags := user.Flags
 
@@ -146,6 +168,15 @@ func produceAlterStmt(user spec.PgUser) string {
 		result = append(result, strings.Join(flags, " "))
 	}
 	return fmt.Sprintf(alterUserSQL, user.Name, strings.Join(result, " "))
+}
+
+func produceAlterRoleSetStmts(user spec.PgUser) []string {
+	result := make([]string, 0)
+	result = append(result, fmt.Sprintf(alterRoleResetAllSQL, user.Name))
+	for name, value := range user.Parameters {
+		result = append(result, fmt.Sprintf(alterRoleSetSQL, user.Name, name, quoteParameterValue(name, value)))
+	}
+	return result
 }
 
 func produceGrantStmt(user spec.PgUser) string {
@@ -159,4 +190,28 @@ func quoteMemberList(user spec.PgUser) string {
 		memberof = append(memberof, fmt.Sprintf(`"%s"`, member))
 	}
 	return strings.Join(memberof, ",")
+}
+
+// quoteVal quotes values to be used at ALTER ROLE SET param = value if necessary
+func quoteParameterValue(name, val string) string {
+	start := val[0]
+	end := val[len(val)-1]
+	if name == "search_path" {
+		// strip single quotes from the search_path. Those are required in the YAML configuration
+		// to quote values containing commas, as otherwise NewFromMap would treat each comma-separated
+		// part of such string as a separate map entry. However, a search_path is interpreted as a list
+		// only if it is not quoted, otherwise it is treated as a single value. Therefore, we strip
+		// single quotes here. Note that you can still use double quotes in order to escape schemas
+		// containing spaces (but something more complex, like double quotes inside double quotes or spaces
+		// in the schema name would break the parsing code in the operator.)
+		if start == '\'' && end == '\'' {
+			return fmt.Sprintf("%s", val[1:len(val)-1])
+		}
+
+		return val
+	}
+	if (start == '"' && end == '"') || (start == '\'' && end == '\'') {
+		return val
+	}
+	return fmt.Sprintf(`'%s'`, strings.Trim(val, " "))
 }

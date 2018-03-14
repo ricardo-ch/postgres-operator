@@ -1,9 +1,12 @@
 package cluster
 
 import (
+	"bytes"
+	"encoding/gob"
 	"encoding/json"
 	"fmt"
 	"math/rand"
+	"sort"
 	"strings"
 	"time"
 
@@ -16,11 +19,60 @@ import (
 	"github.com/zalando-incubator/postgres-operator/pkg/spec"
 	"github.com/zalando-incubator/postgres-operator/pkg/util"
 	"github.com/zalando-incubator/postgres-operator/pkg/util/constants"
+	"github.com/zalando-incubator/postgres-operator/pkg/util/k8sutil"
 	"github.com/zalando-incubator/postgres-operator/pkg/util/retryutil"
 )
 
+// OAuthTokenGetter provides the method for fetching OAuth tokens
+type OAuthTokenGetter interface {
+	getOAuthToken() (string, error)
+}
+
+// SecretOauthTokenGetter enables fetching OAuth tokens by reading Kubernetes secrets
+type SecretOauthTokenGetter struct {
+	kubeClient           *k8sutil.KubernetesClient
+	OAuthTokenSecretName spec.NamespacedName
+}
+
+func NewSecretOauthTokenGetter(kubeClient *k8sutil.KubernetesClient,
+	OAuthTokenSecretName spec.NamespacedName) *SecretOauthTokenGetter {
+	return &SecretOauthTokenGetter{kubeClient, OAuthTokenSecretName}
+}
+
+func (g *SecretOauthTokenGetter) getOAuthToken() (string, error) {
+	//TODO: we can move this function to the Controller in case it will be needed there. As for now we use it only in the Cluster
+	// Temporary getting postgresql-operator secret from the NamespaceDefault
+	credentialsSecret, err := g.kubeClient.
+		Secrets(g.OAuthTokenSecretName.Namespace).
+		Get(g.OAuthTokenSecretName.Name, metav1.GetOptions{})
+
+	if err != nil {
+		return "", fmt.Errorf("could not get credentials secret: %v", err)
+	}
+	data := credentialsSecret.Data
+
+	if string(data["read-only-token-type"]) != "Bearer" {
+		return "", fmt.Errorf("wrong token type: %v", data["read-only-token-type"])
+	}
+
+	return string(data["read-only-token-secret"]), nil
+}
+
 func isValidUsername(username string) bool {
 	return userRegexp.MatchString(username)
+}
+
+func (c *Cluster) isProtectedUsername(username string) bool {
+	for _, protected := range c.OpConfig.ProtectedRoles {
+		if username == protected {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *Cluster) isSystemUsername(username string) bool {
+	return (username == c.OpConfig.SuperUsername || username == c.OpConfig.ReplicationUsername)
 }
 
 func isValidFlag(flag string) bool {
@@ -77,7 +129,7 @@ func normalizeUserFlags(userFlags []string) ([]string, error) {
 	if addLogin {
 		flags = append(flags, constants.RoleFlagLogin)
 	}
-
+	sort.Strings(flags)
 	return flags, nil
 }
 
@@ -149,26 +201,6 @@ func (c *Cluster) logVolumeChanges(old, new spec.Volume) {
 	c.logger.Debugf("diff\n%s\n", util.PrettyDiff(old, new))
 }
 
-func (c *Cluster) getOAuthToken() (string, error) {
-	//TODO: we can move this function to the Controller in case it will be needed there. As for now we use it only in the Cluster
-	// Temporary getting postgresql-operator secret from the NamespaceDefault
-	credentialsSecret, err := c.KubeClient.
-		Secrets(c.OpConfig.OAuthTokenSecretName.Namespace).
-		Get(c.OpConfig.OAuthTokenSecretName.Name, metav1.GetOptions{})
-
-	if err != nil {
-		c.logger.Debugf("oauth token secret name: %q", c.OpConfig.OAuthTokenSecretName)
-		return "", fmt.Errorf("could not get credentials secret: %v", err)
-	}
-	data := credentialsSecret.Data
-
-	if string(data["read-only-token-type"]) != "Bearer" {
-		return "", fmt.Errorf("wrong token type: %v", data["read-only-token-type"])
-	}
-
-	return string(data["read-only-token-secret"]), nil
-}
-
 func (c *Cluster) getTeamMembers() ([]string, error) {
 	if c.Spec.TeamID == "" {
 		return nil, fmt.Errorf("no teamId specified")
@@ -178,7 +210,7 @@ func (c *Cluster) getTeamMembers() ([]string, error) {
 		return []string{}, nil
 	}
 
-	token, err := c.getOAuthToken()
+	token, err := c.oauthTokenGetter.getOAuthToken()
 	if err != nil {
 		return []string{}, fmt.Errorf("could not get oauth token: %v", err)
 	}
@@ -191,7 +223,7 @@ func (c *Cluster) getTeamMembers() ([]string, error) {
 	return teamInfo.Members, nil
 }
 
-func (c *Cluster) waitForPodLabel(podEvents chan spec.PodEvent, role *PostgresRole) error {
+func (c *Cluster) waitForPodLabel(podEvents chan spec.PodEvent, role *PostgresRole) (*v1.Pod, error) {
 	timeout := time.After(c.OpConfig.PodLabelWaitTimeout)
 	for {
 		select {
@@ -200,13 +232,13 @@ func (c *Cluster) waitForPodLabel(podEvents chan spec.PodEvent, role *PostgresRo
 
 			if role == nil {
 				if podRole == Master || podRole == Replica {
-					return nil
+					return podEvent.CurPod, nil
 				}
 			} else if *role == podRole {
-				return nil
+				return podEvent.CurPod, nil
 			}
 		case <-timeout:
-			return fmt.Errorf("pod label wait timeout")
+			return nil, fmt.Errorf("pod label wait timeout")
 		}
 	}
 }
@@ -229,7 +261,7 @@ func (c *Cluster) waitStatefulsetReady() error {
 	return retryutil.Retry(c.OpConfig.ResourceCheckInterval, c.OpConfig.ResourceCheckTimeout,
 		func() (bool, error) {
 			listOptions := metav1.ListOptions{
-				LabelSelector: c.labelsSet().String(),
+				LabelSelector: c.labelsSet(false).String(),
 			}
 			ss, err := c.KubeClient.StatefulSets(c.Namespace).List(listOptions)
 			if err != nil {
@@ -245,7 +277,7 @@ func (c *Cluster) waitStatefulsetReady() error {
 }
 
 func (c *Cluster) waitPodLabelsReady() error {
-	ls := c.labelsSet()
+	ls := c.labelsSet(false)
 	namespace := c.Namespace
 
 	listOptions := metav1.ListOptions{
@@ -281,14 +313,11 @@ func (c *Cluster) waitPodLabelsReady() error {
 				return false, fmt.Errorf("too many masters")
 			}
 			if len(replicaPods.Items) == podsNumber {
-				c.masterLess = true
 				return true, nil
 			}
 
 			return len(masterPods.Items)+len(replicaPods.Items) == podsNumber, nil
 		})
-
-	//TODO: wait for master for a while and then set masterLess flag
 
 	return err
 }
@@ -308,18 +337,26 @@ func (c *Cluster) waitStatefulsetPodsReady() error {
 	return nil
 }
 
-func (c *Cluster) labelsSet() labels.Set {
+// Returns labels used to create or list k8s objects such as pods
+// For backward compatability, shouldAddExtraLabels must be false
+// when listing k8s objects. See operator PR #252
+func (c *Cluster) labelsSet(shouldAddExtraLabels bool) labels.Set {
 	lbls := make(map[string]string)
 	for k, v := range c.OpConfig.ClusterLabels {
 		lbls[k] = v
 	}
 	lbls[c.OpConfig.ClusterNameLabel] = c.Name
 
+	if shouldAddExtraLabels {
+		// enables filtering resources owned by a team
+		lbls["team"] = c.Postgresql.Spec.TeamID
+	}
+
 	return labels.Set(lbls)
 }
 
 func (c *Cluster) roleLabelsSet(role PostgresRole) labels.Set {
-	lbls := c.labelsSet()
+	lbls := c.labelsSet(false)
 	lbls[c.OpConfig.PodRoleLabel] = string(role)
 	return lbls
 }
@@ -355,4 +392,37 @@ func (c *Cluster) credentialSecretNameForCluster(username string, clusterName st
 
 func masterCandidate(replicas []spec.NamespacedName) spec.NamespacedName {
 	return replicas[rand.Intn(len(replicas))]
+}
+
+func cloneSpec(from *spec.Postgresql) (*spec.Postgresql, error) {
+	var (
+		buf    bytes.Buffer
+		result *spec.Postgresql
+		err    error
+	)
+	enc := gob.NewEncoder(&buf)
+	if err = enc.Encode(*from); err != nil {
+		return nil, fmt.Errorf("could not encode the spec: %v", err)
+	}
+	dec := gob.NewDecoder(&buf)
+	if err = dec.Decode(&result); err != nil {
+		return nil, fmt.Errorf("could not decode the spec: %v", err)
+	}
+	return result, nil
+}
+
+func (c *Cluster) setSpec(newSpec *spec.Postgresql) {
+	c.specMu.Lock()
+	c.Postgresql = *newSpec
+	c.specMu.Unlock()
+}
+
+func (c *Cluster) GetSpec() (*spec.Postgresql, error) {
+	c.specMu.RLock()
+	defer c.specMu.RUnlock()
+	return cloneSpec(&c.Postgresql)
+}
+
+func (c *Cluster) patroniUsesKubernetes() bool {
+	return c.OpConfig.EtcdHost == ""
 }

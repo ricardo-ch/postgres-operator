@@ -55,10 +55,11 @@ type Patroni struct {
 // CloneDescription describes which cluster the new should clone and up to which point in time
 type CloneDescription struct {
 	ClusterName  string `json:"cluster,omitempty"`
+	Uid          string `json:"uid,omitempty"`
 	EndTimestamp string `json:"timestamp,omitempty"`
 }
 
-type userFlags []string
+type UserFlags []string
 
 // PostgresStatus contains status of the PostgreSQL cluster (running, creation failed etc.)
 type PostgresStatus string
@@ -100,7 +101,7 @@ type PostgresSpec struct {
 	UseLoadBalancer     *bool                `json:"useLoadBalancer,omitempty"`
 	ReplicaLoadBalancer bool                 `json:"replicaLoadBalancer,omitempty"`
 	NumberOfInstances   int32                `json:"numberOfInstances"`
-	Users               map[string]userFlags `json:"users"`
+	Users               map[string]UserFlags `json:"users"`
 	MaintenanceWindows  []MaintenanceWindow  `json:"maintenanceWindows,omitempty"`
 	Clone               CloneDescription     `json:"clone"`
 	ClusterName         string               `json:"-"`

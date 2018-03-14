@@ -116,7 +116,7 @@ Users:
 	// in worst case we would have one line per user
 	for i := 1; i <= len(data); i++ {
 		properties := []string{"user", "password", "inrole"}
-		t := spec.PgUser{}
+		t := spec.PgUser{Origin: spec.RoleOriginInfrastructure}
 		for _, p := range properties {
 			key := fmt.Sprintf("%s%d", p, i)
 			if val, present := data[key]; !present {
@@ -137,11 +137,19 @@ Users:
 					c.logger.Warningf("unknown key %q", p)
 				}
 			}
+
+			delete(data, key)
 		}
 
 		if t.Name != "" {
 			result[t.Name] = t
 		}
+	}
+
+	if len(data) != 0 {
+		c.logger.Warningf("%d unprocessed entries in the infrastructure roles' secret", len(data))
+		c.logger.Info(`infrastructure role entries should be in the {key}{id} format, where {key} can be either of "user", "password", "inrole" and the {id} a monotonically increasing integer starting with 1`)
+		c.logger.Debugf("unprocessed entries: %#v", data)
 	}
 
 	return result, nil

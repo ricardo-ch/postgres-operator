@@ -2,6 +2,7 @@ package controller
 
 import (
 	"fmt"
+	"sort"
 	"sync/atomic"
 
 	"github.com/Sirupsen/logrus"
@@ -13,9 +14,10 @@ import (
 )
 
 // ClusterStatus provides status of the cluster
-func (c *Controller) ClusterStatus(team, cluster string) (*spec.ClusterStatus, error) {
+func (c *Controller) ClusterStatus(team, namespace, cluster string) (*spec.ClusterStatus, error) {
+
 	clusterName := spec.NamespacedName{
-		Namespace: c.opConfig.Namespace,
+		Namespace: namespace,
 		Name:      team + "-" + cluster,
 	}
 
@@ -30,6 +32,29 @@ func (c *Controller) ClusterStatus(team, cluster string) (*spec.ClusterStatus, e
 	status.Worker = c.clusterWorkerID(clusterName)
 
 	return status, nil
+}
+
+// ClusterDatabasesMap returns for each cluster the list of databases running there
+func (c *Controller) ClusterDatabasesMap() map[string][]string {
+
+	m := make(map[string][]string)
+
+	// avoid modifying the cluster list while we are fetching each one of them.
+	c.clustersMu.RLock()
+	defer c.clustersMu.RUnlock()
+	for _, cluster := range c.clusters {
+		// GetSpec holds the specMu lock of a cluster
+		if spec, err := cluster.GetSpec(); err == nil {
+			for database := range spec.Spec.Databases {
+				m[cluster.Name] = append(m[cluster.Name], database)
+			}
+			sort.Strings(m[cluster.Name])
+		} else {
+			c.logger.Warningf("could not get the list of databases for cluster %q: %v", cluster.Name, err)
+		}
+	}
+
+	return m
 }
 
 // TeamClusterList returns team-clusters map
@@ -66,9 +91,10 @@ func (c *Controller) GetStatus() *spec.ControllerStatus {
 }
 
 // ClusterLogs dumps cluster ring logs
-func (c *Controller) ClusterLogs(team, name string) ([]*spec.LogEntry, error) {
+func (c *Controller) ClusterLogs(team, namespace, name string) ([]*spec.LogEntry, error) {
+
 	clusterName := spec.NamespacedName{
-		Namespace: c.opConfig.Namespace,
+		Namespace: namespace,
 		Name:      team + "-" + name,
 	}
 
@@ -188,9 +214,10 @@ func (c *Controller) WorkerStatus(workerID uint32) (*spec.WorkerStatus, error) {
 }
 
 // ClusterHistory dumps history of cluster changes
-func (c *Controller) ClusterHistory(team, name string) ([]*spec.Diff, error) {
+func (c *Controller) ClusterHistory(team, namespace, name string) ([]*spec.Diff, error) {
+
 	clusterName := spec.NamespacedName{
-		Namespace: c.opConfig.Namespace,
+		Namespace: namespace,
 		Name:      team + "-" + name,
 	}
 

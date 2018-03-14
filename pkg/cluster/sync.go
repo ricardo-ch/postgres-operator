@@ -21,10 +21,11 @@ func (c *Cluster) Sync(newSpec *spec.Postgresql) (err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	c.Postgresql = *newSpec
+	c.setSpec(newSpec)
 
 	defer func() {
 		if err != nil {
+			c.logger.Warningf("error while syncing cluster state: %v", err)
 			c.setStatus(spec.ClusterStatusSyncFailed)
 		} else if c.Status != spec.ClusterStatusRunning {
 			c.setStatus(spec.ClusterStatusRunning)
@@ -58,9 +59,10 @@ func (c *Cluster) Sync(newSpec *spec.Postgresql) (err error) {
 		}
 	}
 
-	if !c.databaseAccessDisabled() {
+	// create database objects unless we are running without pods or disabled that feature explicitely
+	if !(c.databaseAccessDisabled() || c.getNumberOfInstances(&newSpec.Spec) <= 0) {
 		c.logger.Debugf("syncing roles")
-		if err = c.syncRoles(true); err != nil {
+		if err = c.syncRoles(); err != nil {
 			err = fmt.Errorf("could not sync roles: %v", err)
 			return
 		}
@@ -246,6 +248,7 @@ func (c *Cluster) syncStatefulSet() error {
 			return fmt.Errorf("could not get statefulset: %v", err)
 		}
 		// statefulset does not exist, try to re-create it
+		c.Statefulset = nil
 		c.logger.Infof("could not find the cluster's statefulset")
 		pods, err := c.listPods()
 		if err != nil {
@@ -268,7 +271,7 @@ func (c *Cluster) syncStatefulSet() error {
 		c.logger.Infof("found pods without the statefulset: trigger rolling update")
 
 	} else {
-		// statefulset is alrady there, make sure we use its definition in order to compare with the spec.
+		// statefulset is already there, make sure we use its definition in order to compare with the spec.
 		c.Statefulset = sset
 
 		desiredSS, err := c.generateStatefulSet(&c.Spec)
@@ -331,7 +334,11 @@ func (c *Cluster) syncSecret(secretUsername string, secretSpec *v1.Secret, secre
 		if err2 != nil {
 			return fmt.Errorf("could not get current secret: %v", err2)
 		}
-		c.logger.Debugf("secret %q already exists, fetching it's password", util.NameFromMeta(curSecret.ObjectMeta))
+		if secretUsername != string(curSecret.Data["username"]) {
+			c.logger.Warningf("secret %q does not contain the role %q", secretSpec.Name, secretUsername)
+			return nil
+		}
+		c.logger.Debugf("secret %q already exists, fetching its password", util.NameFromMeta(curSecret.ObjectMeta))
 		if secretUsername == c.systemUsers[constants.SuperuserKeyName].Name {
 			secretUsername = constants.SuperuserKeyName
 			userMap = c.systemUsers
@@ -342,8 +349,17 @@ func (c *Cluster) syncSecret(secretUsername string, secretSpec *v1.Secret, secre
 			userMap = c.pgUsers
 		}
 		pwdUser := userMap[secretUsername]
-		pwdUser.Password = string(curSecret.Data["password"])
-		userMap[secretUsername] = pwdUser
+		// if this secret belongs to the infrastructure role and the password has changed - replace it in the secret
+		if pwdUser.Password != string(curSecret.Data["password"]) && pwdUser.Origin == spec.RoleOriginInfrastructure {
+			c.logger.Debugf("updating the secret %q from the infrastructure roles", secretSpec.Name)
+			if _, err := c.KubeClient.Secrets(secretSpec.Namespace).Update(secretSpec); err != nil {
+				return fmt.Errorf("could not update infrastructure role secret for role %q: %v", secretUsername, err)
+			}
+		} else {
+			// for non-infrastructure role - update the role with the password from the secret
+			pwdUser.Password = string(curSecret.Data["password"])
+			userMap[secretUsername] = pwdUser
+		}
 	} else {
 		if err != nil {
 			return fmt.Errorf("could not create secret for user %q: %v", secretUsername, err)
@@ -355,7 +371,7 @@ func (c *Cluster) syncSecret(secretUsername string, secretSpec *v1.Secret, secre
 	return nil
 }
 
-func (c *Cluster) syncRoles(readFromDatabase bool) error {
+func (c *Cluster) syncRoles() error {
 	c.setProcessName("syncing roles")
 
 	var (
@@ -368,16 +384,18 @@ func (c *Cluster) syncRoles(readFromDatabase bool) error {
 	if err != nil {
 		return fmt.Errorf("could not init db connection: %v", err)
 	}
-	defer c.closeDbConn()
+	defer func() {
+		if err := c.closeDbConn(); err != nil {
+			c.logger.Errorf("could not close db connection: %v", err)
+		}
+	}()
 
-	if readFromDatabase {
-		for _, u := range c.pgUsers {
-			userNames = append(userNames, u.Name)
-		}
-		dbUsers, err = c.readPgUsersFromDatabase(userNames)
-		if err != nil {
-			return fmt.Errorf("error getting users from the database: %v", err)
-		}
+	for _, u := range c.pgUsers {
+		userNames = append(userNames, u.Name)
+	}
+	dbUsers, err = c.readPgUsersFromDatabase(userNames)
+	if err != nil {
+		return fmt.Errorf("error getting users from the database: %v", err)
 	}
 
 	pgSyncRequests := c.userSyncStrategy.ProduceSyncRequests(dbUsers, c.pgUsers)

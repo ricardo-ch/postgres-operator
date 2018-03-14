@@ -13,7 +13,7 @@ import (
 
 func (c *Cluster) listPods() ([]v1.Pod, error) {
 	listOptions := metav1.ListOptions{
-		LabelSelector: c.labelsSet().String(),
+		LabelSelector: c.labelsSet(false).String(),
 	}
 
 	pods, err := c.KubeClient.Pods(c.Namespace).List(listOptions)
@@ -32,10 +32,6 @@ func (c *Cluster) getRolePods(role PostgresRole) ([]v1.Pod, error) {
 	pods, err := c.KubeClient.Pods(c.Namespace).List(listOptions)
 	if err != nil {
 		return nil, fmt.Errorf("could not get list of pods: %v", err)
-	}
-
-	if len(pods.Items) == 0 {
-		return nil, fmt.Errorf("no pods")
 	}
 
 	if role == Master && len(pods.Items) > 1 {
@@ -115,9 +111,14 @@ func (c *Cluster) registerPodSubscriber(podName spec.NamespacedName) chan spec.P
 }
 
 func (c *Cluster) movePodFromEndOfLifeNode(pod *v1.Pod) (*v1.Pod, error) {
+	var (
+		eol    bool
+		err    error
+		newPod *v1.Pod
+	)
 	podName := util.NameFromMeta(pod.ObjectMeta)
 
-	if eol, err := c.podIsEndOfLife(pod); err != nil {
+	if eol, err = c.podIsEndOfLife(pod); err != nil {
 		return nil, fmt.Errorf("could not get node %q: %v", pod.Spec.NodeName, err)
 	} else if !eol {
 		c.logger.Infof("pod %q is already on a live node", podName)
@@ -127,20 +128,15 @@ func (c *Cluster) movePodFromEndOfLifeNode(pod *v1.Pod) (*v1.Pod, error) {
 	c.setProcessName("moving pod %q out of end-of-life node %q", podName, pod.Spec.NodeName)
 	c.logger.Infof("moving pod %q out of the end-of-life node %q", podName, pod.Spec.NodeName)
 
-	if err := c.recreatePod(podName); err != nil {
+	if newPod, err = c.recreatePod(podName); err != nil {
 		return nil, fmt.Errorf("could not move pod: %v", err)
-	}
-
-	newPod, err := c.KubeClient.Pods(podName.Namespace).Get(podName.Name, metav1.GetOptions{})
-	if err != nil {
-		return nil, fmt.Errorf("could not get pod: %v", err)
 	}
 
 	if newPod.Spec.NodeName == pod.Spec.NodeName {
 		return nil, fmt.Errorf("pod %q remained on the same node", podName)
 	}
 
-	if eol, err := c.podIsEndOfLife(newPod); err != nil {
+	if eol, err = c.podIsEndOfLife(newPod); err != nil {
 		return nil, fmt.Errorf("could not get node %q: %v", pod.Spec.NodeName, err)
 	} else if eol {
 		c.logger.Warningf("pod %q moved to end-of-life node %q", podName, newPod.Spec.NodeName)
@@ -156,6 +152,11 @@ func (c *Cluster) masterCandidate(oldNodeName string) (*v1.Pod, error) {
 	replicas, err := c.getRolePods(Replica)
 	if err != nil {
 		return nil, fmt.Errorf("could not get replica pods: %v", err)
+	}
+
+	if len(replicas) == 0 {
+		c.logger.Warningf("single master pod for cluster %q, migration will cause disruption of the service")
+		return nil, nil
 	}
 
 	for i, pod := range replicas {
@@ -198,21 +199,25 @@ func (c *Cluster) MigrateMasterPod(podName spec.NamespacedName) error {
 		return fmt.Errorf("could not get new master candidate: %v", err)
 	}
 
-	pod, err := c.movePodFromEndOfLifeNode(masterCandidatePod)
-	if err != nil {
-		return fmt.Errorf("could not move pod: %v", err)
-	}
+	// there are two cases for each postgres cluster that has its master pod on the node to migrate from:
+	// - the cluster has some replicas - migrate one of those if necessary and failover to it
+	// - there are no replicas - just terminate the master and wait until it respawns
+	// in both cases the result is the new master up and running on a new node.
+	if masterCandidatePod != nil {
+		pod, err := c.movePodFromEndOfLifeNode(masterCandidatePod)
+		if err != nil {
+			return fmt.Errorf("could not move pod: %v", err)
+		}
 
-	masterCandidateName := util.NameFromMeta(pod.ObjectMeta)
-	if err := c.ManualFailover(oldMaster, masterCandidateName); err != nil {
-		return fmt.Errorf("could not failover to pod %q: %v", masterCandidateName, err)
+		masterCandidateName := util.NameFromMeta(pod.ObjectMeta)
+		if err := c.ManualFailover(oldMaster, masterCandidateName); err != nil {
+			return fmt.Errorf("could not failover to pod %q: %v", masterCandidateName, err)
+		}
+	} else {
+		if _, err = c.movePodFromEndOfLifeNode(oldMaster); err != nil {
+			return fmt.Errorf("could not move pod: %v", err)
+		}
 	}
-
-	_, err = c.movePodFromEndOfLifeNode(oldMaster)
-	if err != nil {
-		return fmt.Errorf("could not move pod: %v", err)
-	}
-
 	return nil
 }
 
@@ -242,28 +247,28 @@ func (c *Cluster) MigrateReplicaPod(podName spec.NamespacedName, fromNodeName st
 	return nil
 }
 
-func (c *Cluster) recreatePod(podName spec.NamespacedName) error {
+func (c *Cluster) recreatePod(podName spec.NamespacedName) (*v1.Pod, error) {
 	ch := c.registerPodSubscriber(podName)
 	defer c.unregisterPodSubscriber(podName)
 
 	if err := c.KubeClient.Pods(podName.Namespace).Delete(podName.Name, c.deleteOptions); err != nil {
-		return fmt.Errorf("could not delete pod: %v", err)
+		return nil, fmt.Errorf("could not delete pod: %v", err)
 	}
 
 	if err := c.waitForPodDeletion(ch); err != nil {
-		return err
+		return nil, err
 	}
-	if err := c.waitForPodLabel(ch, nil); err != nil {
-		return err
+	if pod, err := c.waitForPodLabel(ch, nil); err != nil {
+		return nil, err
+	} else {
+		c.logger.Infof("pod %q has been recreated", podName)
+		return pod, nil
 	}
-	c.logger.Infof("pod %q has been recreated", podName)
-
-	return nil
 }
 
 func (c *Cluster) recreatePods() error {
 	c.setProcessName("recreating pods")
-	ls := c.labelsSet()
+	ls := c.labelsSet(false)
 	namespace := c.Namespace
 
 	listOptions := metav1.ListOptions{
@@ -276,7 +281,9 @@ func (c *Cluster) recreatePods() error {
 	}
 	c.logger.Infof("there are %d pods in the cluster to recreate", len(pods.Items))
 
-	var masterPod *v1.Pod
+	var (
+		masterPod, newMasterPod, newPod *v1.Pod
+	)
 	replicas := make([]spec.NamespacedName, 0)
 	for i, pod := range pods.Items {
 		role := PostgresRole(pod.Labels[c.OpConfig.PodRoleLabel])
@@ -287,27 +294,29 @@ func (c *Cluster) recreatePods() error {
 		}
 
 		podName := util.NameFromMeta(pods.Items[i].ObjectMeta)
-		if err := c.recreatePod(podName); err != nil {
+		if newPod, err = c.recreatePod(podName); err != nil {
 			return fmt.Errorf("could not recreate replica pod %q: %v", util.NameFromMeta(pod.ObjectMeta), err)
 		}
-
-		replicas = append(replicas, util.NameFromMeta(pod.ObjectMeta))
+		if newRole := PostgresRole(newPod.Labels[c.OpConfig.PodRoleLabel]); newRole == Replica {
+			replicas = append(replicas, util.NameFromMeta(pod.ObjectMeta))
+		} else if newRole == Master {
+			newMasterPod = newPod
+		}
 	}
 
-	if masterPod == nil {
-		c.logger.Warningln("no master pod in the cluster")
-	} else {
-		if len(replicas) > 0 {
-			err := c.ManualFailover(masterPod, masterCandidate(replicas))
-			if err != nil {
-				return fmt.Errorf("could not perform manual failover: %v", err)
+	if masterPod != nil {
+		// failover if we have not observed a master pod when re-creating former replicas.
+		if newMasterPod == nil && len(replicas) > 0 {
+			if err := c.ManualFailover(masterPod, masterCandidate(replicas)); err != nil {
+				c.logger.Warningf("could not perform failover: %v", err)
 			}
+		} else if newMasterPod == nil && len(replicas) == 0 {
+			c.logger.Warningf("cannot switch master role before re-creating the pod: no replicas")
 		}
-		//TODO: specify master, leave new master empty
-		c.logger.Infof("recreating master pod %q", util.NameFromMeta(masterPod.ObjectMeta))
+		c.logger.Infof("recreating old master pod %q", util.NameFromMeta(masterPod.ObjectMeta))
 
-		if err := c.recreatePod(util.NameFromMeta(masterPod.ObjectMeta)); err != nil {
-			return fmt.Errorf("could not recreate master pod %q: %v", util.NameFromMeta(masterPod.ObjectMeta), err)
+		if _, err := c.recreatePod(util.NameFromMeta(masterPod.ObjectMeta)); err != nil {
+			return fmt.Errorf("could not recreate old master pod %q: %v", util.NameFromMeta(masterPod.ObjectMeta), err)
 		}
 	}
 
@@ -319,6 +328,6 @@ func (c *Cluster) podIsEndOfLife(pod *v1.Pod) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	return node.Spec.Unschedulable || util.MapContains(node.Labels, c.OpConfig.EOLNodeLabel), nil
+	return node.Spec.Unschedulable || !util.MapContains(node.Labels, c.OpConfig.NodeReadinessLabel), nil
 
 }
