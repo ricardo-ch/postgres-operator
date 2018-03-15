@@ -424,6 +424,10 @@ func (c *Cluster) generatePodTemplate(
 				ContainerPort: 8080,
 				Protocol:      v1.ProtocolTCP,
 			},
+			{
+				ContainerPort: 9187,
+				Protocol:      v1.ProtocolTCP,
+			},
 		},
 		VolumeMounts: volumeMounts,
 		Env:          envVars,
