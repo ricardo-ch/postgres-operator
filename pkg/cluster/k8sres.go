@@ -504,6 +504,9 @@ func (c *Cluster) generatePodTemplate(
 		template.Annotations = map[string]string{constants.KubeIAmAnnotation: c.OpConfig.KubeIAMRole}
 	}
 
+	template.Annotations[constants.PrometheusPortAnnotation] = "9187"
+	template.Annotations[constants.PrometheusScrapeAnnotation] = "true"
+
 	return &template
 }
 
