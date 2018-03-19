@@ -500,12 +500,13 @@ func (c *Cluster) generatePodTemplate(
 		},
 		Spec: podSpec,
 	}
-	if c.OpConfig.KubeIAMRole != "" {
-		template.Annotations = map[string]string{constants.KubeIAmAnnotation: c.OpConfig.KubeIAMRole}
-	}
 
-	template.Annotations[constants.PrometheusPortAnnotation] = "9187"
-	template.Annotations[constants.PrometheusScrapeAnnotation] = "true"
+	template.Annotations = map[string]string{constants.PrometheusPortAnnotation: "9187",
+		constants.PrometheusScrapeAnnotation: "true"}
+
+	if c.OpConfig.KubeIAMRole != "" {
+		template.Annotations[constants.KubeIAmAnnotation] = c.OpConfig.KubeIAMRole
+	}
 
 	return &template
 }
